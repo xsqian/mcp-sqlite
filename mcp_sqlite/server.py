@@ -8,8 +8,13 @@ import aiosqlite
 import anyio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
 from mcp.types import TextContent, Tool
 from pydantic import BaseModel, Field
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
+from starlette.routing import Route
+import uvicorn
 import yaml
 
 
@@ -228,16 +233,58 @@ async def mcp_sqlite_server(sqlite_file: str, metadata: RootMetadata = RootMetad
     return server
 
 
-async def run_server(sqlite_file: str, metadata_yaml_file: str | None = None, prefix: str = ""):
+async def run_server(
+    sqlite_file: str,
+    metadata_yaml_file: str | None = None,
+    prefix: str = "",
+    transport: str = "stdio",
+    host: str = "localhost",
+    port: int = 8000,
+):
     if metadata_yaml_file:
         with open(metadata_yaml_file, "r") as metadata_file_descriptor:
             metadata_dict = yaml.safe_load(metadata_file_descriptor.read())
     else:
         metadata_dict = {}
     server = await mcp_sqlite_server(sqlite_file=sqlite_file, metadata=RootMetadata(**metadata_dict), prefix=prefix)
-    options = server.create_initialization_options()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, options)
+    
+    if transport == "sse":
+        sse = SseServerTransport("/messages")
+        
+        async def handle_sse(request):
+            async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+                await server.run(
+                    streams[0], streams[1], server.create_initialization_options()
+                )
+        
+        async def handle_messages(request):
+            await sse.handle_post_message(request.scope, request.receive, request._send)
+        
+        app = Starlette(
+            routes=[
+                Route("/sse", endpoint=handle_sse),
+                Route("/messages", endpoint=handle_messages, methods=["POST"]),
+            ]
+        )
+        
+        # Add CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        logging.info(f"Starting SSE server on {host}:{port}")
+        await uvicorn.Server(
+            config=uvicorn.Config(app, host=host, port=port, log_level="info")
+        ).serve()
+    else:
+        # Default to stdio
+        options = server.create_initialization_options()
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, options)
 
 
 def main_cli():
@@ -261,6 +308,24 @@ def main_cli():
         default="",
     )
     parser.add_argument(
+        "-t",
+        "--transport",
+        help="Transport protocol to use: 'stdio' or 'sse'. Defaults to 'stdio'.",
+        choices=["stdio", "sse"],
+        default="stdio",
+    )
+    parser.add_argument(
+        "--host",
+        help="Host to bind SSE server to (only used with --transport sse). Defaults to 'localhost'.",
+        default="localhost",
+    )
+    parser.add_argument(
+        "--port",
+        help="Port to bind SSE server to (only used with --transport sse). Defaults to 8000.",
+        type=int,
+        default=8000,
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         help="Be verbose. Include once for INFO output, twice for DEBUG output.",
@@ -270,7 +335,7 @@ def main_cli():
     args = parser.parse_args()
     LOGGING_LEVELS = [logging.WARNING, logging.INFO, logging.DEBUG]
     logging.basicConfig(level=LOGGING_LEVELS[min(args.verbose, len(LOGGING_LEVELS) - 1)])  # cap to last level index
-    anyio.run(run_server, args.sqlite_file, args.metadata, args.prefix)
+    anyio.run(run_server, args.sqlite_file, args.metadata, args.prefix, args.transport, args.host, args.port)
 
 
 if __name__ == "__main__":
